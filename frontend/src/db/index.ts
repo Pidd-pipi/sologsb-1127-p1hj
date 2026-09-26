@@ -4,7 +4,7 @@ import type { Inspection } from '../types/inspection';
 import type { RouteSegment } from '../types/route';
 import type { RectifyPlan } from '../types/rectify';
 import { addDays, makeId, todayStr, toPlain } from '../utils/format';
-import { judgeInspection } from '../utils/routeCheck';
+import { judgeInspection, buildVerdict, latestInspectionMap } from '../utils/routeCheck';
 
 export const DB_NAME = 'gbaccessmap-db';
 
@@ -327,10 +327,16 @@ function buildSeed() {
     };
   });
   const routes: RouteSegment[] = [];
+  const pointNameById = new Map(points.map((p) => [p.id, p.name]));
+  const seedLatestMap = latestInspectionMap(inspections);
+  const seedCtx = {
+    nameOf: (pointId: string) => pointNameById.get(pointId) ?? pointId,
+    latestInspectionOf: (pointId: string) => seedLatestMap.get(pointId),
+  };
   SEED_ROUTES.forEach((r, ri) => {
+    const drafts: Omit<RouteSegment, 'id' | 'wheelchairPassable' | 'createdAt'>[] = [];
     for (let i = 1; i < r.pointIds.length; i += 1) {
-      routes.push({
-        id: `rts-seed-${ri + 1}-${i}`,
+      drafts.push({
         routeName: r.routeName,
         fromPointId: r.pointIds[i - 1],
         toPointId: r.pointIds[i],
@@ -338,11 +344,18 @@ function buildSeed() {
         obstacleCount: r.obstacleCount,
         stepCount: r.stepCount,
         curbHeight: r.curbHeight,
-        wheelchairPassable: r.stepCount === 0 && r.curbHeight <= 3 && r.obstacleCount <= 2,
         order: i,
-        createdAt: now,
       });
     }
+    // 保存时刻快照：与路线编制保存同一规则（物理条件 + 点位最新核验闸门）
+    drafts.forEach((d, i) => {
+      routes.push({
+        id: `rts-seed-${ri + 1}-${i + 1}`,
+        ...d,
+        wheelchairPassable: buildVerdict(r.routeName, drafts, seedCtx).passable,
+        createdAt: now,
+      });
+    });
   });
   const rectifies: RectifyPlan[] = [
     {

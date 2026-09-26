@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { db } from '../db';
 import type { AccessPoint } from '../types/point';
-import type { RouteSegment } from '../types/route';
+import type { RouteJudgeContext, RouteSegment } from '../types/route';
 import { makeId, toPlain } from '../utils/format';
 import { judgeSegment, buildVerdict } from '../utils/routeCheck';
 import { segmentLength } from '../utils/geo';
@@ -35,8 +35,8 @@ interface RouteState {
   buildChainSegments: (points: AccessPoint[]) => void;
   updateDraftSegment: (key: string, patch: Partial<DraftSegment>) => void;
   removeDraftSegment: (key: string) => void;
-  computeVerdict: () => RouteVerdict;
-  saveRoute: () => Promise<number>;
+  computeVerdict: (ctx: RouteJudgeContext) => RouteVerdict;
+  saveRoute: (ctx: RouteJudgeContext) => Promise<number>;
   resetDraft: () => void;
 }
 
@@ -119,26 +119,29 @@ export const useRouteStore = create<RouteState>((set, get) => ({
       verdict: null,
     })),
 
-  computeVerdict: () => {
+  computeVerdict: (ctx) => {
     const { draftSegments, draftName } = get();
-    const verdict = buildVerdict(draftName, draftSegments);
+    const verdict = buildVerdict(draftName, draftSegments, ctx);
     set({ verdict });
     return verdict;
   },
 
-  saveRoute: async () => {
+  saveRoute: async (ctx) => {
     const { draftSegments, draftName } = get();
+    const routeName = draftName || '未命名路线';
+    // 保存前按同一规则判定（物理条件 + 两端点位最新核验闸门），
+    // 仅把保存时刻的结果作为快照落库，历史记录之后不再改写。
     const rows: RouteSegment[] = draftSegments.map((seg) =>
       toPlain({
         id: makeId('rts'),
-        routeName: draftName || '未命名路线',
+        routeName,
         fromPointId: seg.fromPointId,
         toPointId: seg.toPointId,
         length: seg.length,
         obstacleCount: seg.obstacleCount,
         stepCount: seg.stepCount,
         curbHeight: seg.curbHeight,
-        wheelchairPassable: judgeSegment(seg).passable,
+        wheelchairPassable: judgeSegment(seg, ctx).passable,
         order: seg.order,
         createdAt: new Date().toISOString(),
       }),
