@@ -37,7 +37,7 @@ docker compose down
 | `/` | 核验总览：按行政区与设施类型汇总点位数、合格率、待整改数，点击统计块下钻清单 | AccessPoint / Inspection / RectifyPlan |
 | `/points/new` | 点位登记：地图打点或手填经纬度，可同时录入首次核验实测值 | AccessPoint / Inspection |
 | `/points/:id` | 点位详情：地图定位与属性、核验历史、就地新增核验、整改跟踪 | 四个模型 |
-| `/routes` | 通行路线编制：选点自动串联路段，逐段填障碍数/台阶数/路缘高差，输出全线判定 | RouteSegment / AccessPoint |
+| `/routes` | 通行路线编制：选点自动串联路段，逐段填障碍数/台阶数/路缘高差，全线判定同时核验沿线点位最新核验结论 | RouteSegment / AccessPoint / Inspection |
 | `/map` | 设施地图：按设施类型着色渲染点位，点选弹出核验摘要 | AccessPoint / Inspection |
 | `/rectify` | 整改清单：按状态与期限分组、逾期置顶，登记复检结果 | RectifyPlan / AccessPoint |
 
@@ -47,7 +47,7 @@ docker compose down
 | --- | --- | --- |
 | AccessPoint | `src/types/point.ts` | 点位编号、名称、设施类型、经纬度、行政区、所在道路或建筑、建成年代、养护单位 |
 | Inspection | `src/types/inspection.ts` | 核验日期、核验人、坡度 %、净宽 cm、扶手、盲道连续性、占用情况、结论、问题描述 |
-| RouteSegment | `src/types/route.ts` | 路线名称、起点/终点点位、长度、障碍数、台阶数、路缘高差、是否可轮椅通行 |
+| RouteSegment | `src/types/route.ts` | 路线名称、起点/终点点位、长度、障碍数、台阶数、路缘高差、保存当时可轮椅通行快照（落库不改写，当前判定实时重算） |
 | RectifyPlan | `src/types/rectify.ts` | 点位 id、整改要求、责任单位、整改期限、复检日期、状态 |
 
 ## 数据存储
@@ -91,8 +91,14 @@ sologsb-1127/
         └── utils/{routeCheck,geo,format}.ts
 ```
 
-## 判定阈值（`src/utils/routeCheck.ts`）
+## 判定规则（`src/utils/routeCheck.ts`）
 
 - 坡度：≤ 5% 合格，> 5% 限期整改，> 8% 不合格；
 - 净宽：≥ 120cm 合格，< 120cm 限期整改，< 90cm 不合格；
 - 路缘高差：≤ 3cm 可轮椅通行，> 6cm 判定不可通行；存在台阶需绕行或增设坡道。
+- **路线全线判定（点位核验口径）**：沿线每个点位（起点、途经点、终点，按路线顺序去重）都必须有**最新一条**结论为「合格」的核验记录；
+  - 未核验（无任何核验记录）、最新结论为「限期整改」或「不合格」的点位，均使**全线不可通行**，判定结果列出点位名称与原因（核验日期、结论、问题描述）；
+  - 历史合格记录已被新结论覆盖时不作数，只认最新核验；
+  - 保存路段时按同一规则把结果写入 `wheelchairPassable` 快照；
+  - 已编制路线的全线判定与「当前判定」列始终依据当前核验数据实时重算：新增核验即自动改变结果，复测合格后自动恢复可通行；
+  - 历史路线记录本身（长度、台阶、高差、保存时快照）落库后不再改写。

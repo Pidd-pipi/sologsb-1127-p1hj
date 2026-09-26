@@ -1,11 +1,18 @@
 import { create } from 'zustand';
 import { db } from '../db';
 import type { AccessPoint } from '../types/point';
+import type { Inspection } from '../types/inspection';
 import type { RouteSegment } from '../types/route';
 import { makeId, toPlain } from '../utils/format';
-import { judgeSegment, buildVerdict } from '../utils/routeCheck';
+import {
+  buildVerdict,
+  judgePoint,
+  judgeSegmentWithPoints,
+  latestInspectionOf,
+} from '../utils/routeCheck';
 import { segmentLength } from '../utils/geo';
 import type { RouteVerdict } from '../types/route';
+import { usePointStore } from './pointStore';
 
 /** 编辑中的路段（尚未落库） */
 export interface DraftSegment {
@@ -102,7 +109,12 @@ export const useRouteStore = create<RouteState>((set, get) => ({
         order: i,
       });
     }
-    set({ draftSegments, verdict: null });
+    // 串联后立即按当前最新核验给一次全线判定，未核验点位会直接阻断
+    const verdict = buildVerdict(get().draftName, draftSegments, {
+      inspections: usePointStore.getState().inspections,
+      nameOf: (id) => byId.get(id)?.name,
+    });
+    set({ draftSegments, verdict });
   },
 
   updateDraftSegment: (key, patch) =>
@@ -121,15 +133,24 @@ export const useRouteStore = create<RouteState>((set, get) => ({
 
   computeVerdict: () => {
     const { draftSegments, draftName } = get();
-    const verdict = buildVerdict(draftName, draftSegments);
+    const { inspections, points } = usePointStore.getState();
+    const byId = new Map(points.map((p) => [p.id, p]));
+    const verdict = buildVerdict(draftName, draftSegments, {
+      inspections,
+      nameOf: (id) => byId.get(id)?.name,
+    });
     set({ verdict });
     return verdict;
   },
 
   saveRoute: async () => {
     const { draftSegments, draftName } = get();
-    const rows: RouteSegment[] = draftSegments.map((seg) =>
-      toPlain({
+    const inspections: Inspection[] = usePointStore.getState().inspections;
+    // 保存前按同一规则判定：物理指标 + 起讫点位最新核验，任一不达标快照即为不可通行
+    const rows: RouteSegment[] = draftSegments.map((seg) => {
+      const from = judgePoint(seg.fromPointId, latestInspectionOf(inspections, seg.fromPointId));
+      const to = judgePoint(seg.toPointId, latestInspectionOf(inspections, seg.toPointId));
+      return toPlain({
         id: makeId('rts'),
         routeName: draftName || '未命名路线',
         fromPointId: seg.fromPointId,
@@ -138,11 +159,11 @@ export const useRouteStore = create<RouteState>((set, get) => ({
         obstacleCount: seg.obstacleCount,
         stepCount: seg.stepCount,
         curbHeight: seg.curbHeight,
-        wheelchairPassable: judgeSegment(seg).passable,
+        wheelchairPassable: judgeSegmentWithPoints(seg, { from, to }).passable,
         order: seg.order,
         createdAt: new Date().toISOString(),
-      }),
-    );
+      });
+    });
     if (!rows.length) return 0;
     await db.routes.bulkPut(rows);
     const all = await db.routes.toArray();

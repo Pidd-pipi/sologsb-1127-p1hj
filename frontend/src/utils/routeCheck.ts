@@ -1,5 +1,5 @@
 import type { Inspection, InspectionConclusion, OccupiedLevel } from '../types/inspection';
-import type { RouteSegment, RouteVerdict } from '../types/route';
+import type { PointVerdict, RouteSegment, RouteVerdict } from '../types/route';
 
 /** 阈值常量：依据《无障碍设计规范》常用核验口径 */
 export const SLOPE_PASS = 5; // 坡度 ≤ 5% 为合格
@@ -55,7 +55,73 @@ export function rejudge(inspection: Inspection): JudgeResult {
   });
 }
 
-/** 单段可轮椅通行判定 */
+/**
+ * 取一个点位的最新核验记录（按核验日期，同日按入库时间兜底）。
+ * 路线是否可通行只认最新一次核验：历史合格记录已被新结论覆盖时不再作数。
+ */
+export function latestInspectionOf(inspections: Inspection[], pointId: string): Inspection | null {
+  let latest: Inspection | null = null;
+  for (const ins of inspections) {
+    if (ins.pointId !== pointId) continue;
+    if (
+      !latest ||
+      ins.date > latest.date ||
+      (ins.date === latest.date && ins.createdAt > latest.createdAt)
+    ) {
+      latest = ins;
+    }
+  }
+  return latest;
+}
+
+/**
+ * 单个点位的通行核验判定。
+ * 未核验、限期整改、不合格均不可通行；只有最新核验结论为「合格」才可通行。
+ */
+export function judgePoint(pointId: string, latest: Inspection | null): PointVerdict {
+  if (!latest) {
+    return {
+      pointId,
+      status: '未核验',
+      latest: null,
+      passable: false,
+      reasons: ['尚无核验记录，无法确认通行条件'],
+    };
+  }
+  if (latest.conclusion === '合格') {
+    return {
+      pointId,
+      status: '合格',
+      latest,
+      passable: true,
+      reasons: [`${latest.date} 核验合格`],
+    };
+  }
+  if (latest.conclusion === '限期整改') {
+    return {
+      pointId,
+      status: '限期整改',
+      latest,
+      passable: false,
+      reasons: [
+        `${latest.date} 核验结论为「限期整改」，整改复检合格前不可通行` +
+          (latest.problem ? `；问题：${latest.problem}` : ''),
+      ],
+    };
+  }
+  return {
+    pointId,
+    status: '不合格',
+    latest,
+    passable: false,
+    reasons: [
+      `${latest.date} 核验结论为「不合格」` +
+        (latest.problem ? `；问题：${latest.problem}` : ''),
+    ],
+  };
+}
+
+/** 单段物理指标判定（长度、障碍数、台阶数、路缘高差），不包含端点核验 */
 export function judgeSegment(seg: Pick<RouteSegment, 'curbHeight' | 'stepCount' | 'obstacleCount'>): {
   passable: boolean;
   reasons: string[];
@@ -70,33 +136,84 @@ export function judgeSegment(seg: Pick<RouteSegment, 'curbHeight' | 'stepCount' 
   return { passable: reasons.length === 0, reasons };
 }
 
-/** 全线判定：逐段判定后汇总 */
+/** 单段完整判定：物理指标 + 起讫点位最新核验，任一不达标该段即不可通行 */
+export function judgeSegmentWithPoints(
+  seg: Pick<RouteSegment, 'curbHeight' | 'stepCount' | 'obstacleCount'>,
+  endpoints: { from: PointVerdict; to: PointVerdict },
+): { passable: boolean; reasons: string[] } {
+  const { reasons } = judgeSegment(seg);
+  if (!endpoints.from.passable) {
+    reasons.push(`起点点位核验未通过：${endpoints.from.reasons.join('；')}`);
+  }
+  if (!endpoints.to.passable) {
+    reasons.push(`终点点位核验未通过：${endpoints.to.reasons.join('；')}`);
+  }
+  return { passable: reasons.length === 0, reasons };
+}
+
+/** 全线判定所需的核验上下文 */
+export interface VerdictContext {
+  /** 全部核验记录，函数内部按点位取最新一条 */
+  inspections: Inspection[];
+  /** 点位名称查表（可选），用于在阻断原因中点名具体点位 */
+  nameOf?: (pointId: string) => string | undefined;
+}
+
+/**
+ * 全线判定：逐段物理判定 + 全线涉及点位的最新核验汇总。
+ * 任一点位未核验 / 限期整改 / 不合格，或任一段物理指标不达标，全线即不可通行。
+ * context 缺省时仅按物理指标判定（不应在正式流程中使用）。
+ */
 export function buildVerdict(
   routeName: string,
   segments: Pick<
     RouteSegment,
     'curbHeight' | 'stepCount' | 'obstacleCount' | 'length' | 'order' | 'fromPointId' | 'toPointId'
   >[],
+  context?: VerdictContext,
 ): RouteVerdict {
   const ordered = [...segments].sort((a, b) => a.order - b.order);
   const totalLength = Math.round(ordered.reduce((n, s) => n + (Number(s.length) || 0), 0) * 10) / 10;
   const totalObstacles = ordered.reduce((n, s) => n + (Number(s.obstacleCount) || 0), 0);
   const totalSteps = ordered.reduce((n, s) => n + (Number(s.stepCount) || 0), 0);
   const maxCurbHeight = ordered.reduce((n, s) => Math.max(n, Number(s.curbHeight) || 0), 0);
-  const reasons: string[] = [];
+
+  // 按路线顺序收集涉及点位（起点与各段终点），去重但保留首次出现的顺序
+  const pointIds: string[] = [];
   ordered.forEach((s) => {
-    const r = judgeSegment(s);
-    if (!r.passable) {
-      reasons.push(`第 ${s.order} 段：${r.reasons.join('；')}`);
+    [s.fromPointId, s.toPointId].forEach((pid) => {
+      if (!pointIds.includes(pid)) pointIds.push(pid);
+    });
+  });
+
+  const pointVerdicts: PointVerdict[] = pointIds.map((pid) =>
+    judgePoint(pid, context ? latestInspectionOf(context.inspections, pid) : null),
+  );
+  const qualifiedPoints = pointVerdicts.filter((v) => v.passable).length;
+
+  const reasons: string[] = [];
+  pointVerdicts.forEach((pv) => {
+    if (!pv.passable) {
+      const name = context?.nameOf?.(pv.pointId);
+      reasons.push(`点位 ${name ? `${name}（` : ''}${pv.pointId}${name ? '）' : ''}：${pv.reasons.join('；')}`);
     }
   });
+  ordered.forEach((s) => {
+    const physical = judgeSegment(s);
+    if (!physical.passable) {
+      reasons.push(`第 ${s.order} 段：${physical.reasons.join('；')}`);
+    }
+  });
+
   return {
     routeName,
-    passable: reasons.length === 0 && ordered.length > 0,
+    passable: ordered.length > 0 && reasons.length === 0,
     totalLength,
     totalObstacles,
     totalSteps,
     maxCurbHeight,
     reasons: ordered.length === 0 ? ['尚未串联路段'] : reasons,
+    pointVerdicts,
+    qualifiedPoints,
   };
 }

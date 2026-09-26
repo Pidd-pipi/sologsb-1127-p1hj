@@ -327,18 +327,32 @@ function buildSeed() {
     };
   });
   const routes: RouteSegment[] = [];
+  // 保存时快照与路线判定同一口径：物理指标达标且起讫点位最新核验均为「合格」
+  const latestConclusion = (pointId: string): string => {
+    const list = inspections
+      .filter((i) => i.pointId === pointId)
+      .sort((a, b) => (a.date < b.date ? 1 : -1));
+    return list[0]?.conclusion ?? '';
+  };
   SEED_ROUTES.forEach((r, ri) => {
     for (let i = 1; i < r.pointIds.length; i += 1) {
+      const fromId = r.pointIds[i - 1];
+      const toId = r.pointIds[i];
+      const physicalPassable =
+        r.stepCount === 0 && r.curbHeight <= 3 && r.obstacleCount <= 2;
       routes.push({
         id: `rts-seed-${ri + 1}-${i}`,
         routeName: r.routeName,
-        fromPointId: r.pointIds[i - 1],
-        toPointId: r.pointIds[i],
+        fromPointId: fromId,
+        toPointId: toId,
         length: Math.round((r.length / (r.pointIds.length - 1)) * 10) / 10,
         obstacleCount: r.obstacleCount,
         stepCount: r.stepCount,
         curbHeight: r.curbHeight,
-        wheelchairPassable: r.stepCount === 0 && r.curbHeight <= 3 && r.obstacleCount <= 2,
+        wheelchairPassable:
+          physicalPassable &&
+          latestConclusion(fromId) === '合格' &&
+          latestConclusion(toId) === '合格',
         order: i,
         createdAt: now,
       });
